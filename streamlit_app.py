@@ -4,14 +4,15 @@ import numpy as np
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 
-st.set_page_config(page_title="Last Mile Router", layout="wide")
+# --- APP CONFIG ---
+st.set_page_config(page_title="City & Store Delivery Router", layout="wide")
 
-def solve_vrp(group_df, vehicle_capacity_kg=40, weight_per_order=1.5):
-    """Core routing engine using Google OR-Tools."""
+def solve_vrp(group_df, capacity_kg=40, weight_per_order=1.5):
+    """Routing Engine: Groups by SA within the selected Store."""
+    group_df = group_df[group_df['order_status'] != 'cancelled'].copy()
     if len(group_df) == 0: return pd.DataFrame()
 
-    # Note: In production, replace this with actual Lat/Long from a Geocoding API
-    # Here we simulate coordinates based on Pincode for spatial clustering
+    # Simulation coordinates for clustering (replace with real geocoding in prod)
     group_df['lat'] = 12.97 + (group_df['Pincode'] % 100) * 0.01 + (group_df['order_id'] % 100) * 0.0001
     group_df['lon'] = 77.59 + (group_df['Pincode'] % 100) * 0.01 + (group_df['order_id'] % 77) * 0.0001
 
@@ -19,18 +20,14 @@ def solve_vrp(group_df, vehicle_capacity_kg=40, weight_per_order=1.5):
     locations = [[depot_lat, depot_lon]] + group_df[['lat', 'lon']].values.tolist()
     order_ids = ["DEPOT"] + group_df['order_id'].tolist()
     
-    num_locations = len(locations)
-    weights = [0] + [int(weight_per_order * 10)] * (num_locations - 1)
-    max_cap_units = int(vehicle_capacity_kg * 10)
+    weights = [0] + [int(weight_per_order * 10)] * (len(locations) - 1)
+    max_cap_units = int(capacity_kg * 10)
     
-    # Estimate required vehicles
-    num_vehicles = int(np.ceil((len(group_df) * weight_per_order) / vehicle_capacity_kg)) + 2
-    
-    # Distance Matrix (Euclidean approximation)
+    # Estimate vehicles
+    num_vehicles = int(np.ceil((len(group_df) * weight_per_order) / capacity_kg)) + 2
     dist_matrix = [[int(np.hypot(l1[0]-l2[0], l1[1]-l2[1]) * 100000) for l2 in locations] for l1 in locations]
 
-    # Solver
-    manager = pywrapcp.RoutingIndexManager(num_locations, num_vehicles, 0)
+    manager = pywrapcp.RoutingIndexManager(len(locations), num_vehicles, 0)
     routing = pywrapcp.RoutingModel(manager)
 
     def distance_callback(from_index, to_index):
@@ -47,10 +44,9 @@ def solve_vrp(group_df, vehicle_capacity_kg=40, weight_per_order=1.5):
 
     search_params = pywrapcp.DefaultRoutingSearchParameters()
     search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    search_params.time_limit.seconds = 2
+    search_params.time_limit.seconds = 1
 
     solution = routing.SolveWithParameters(search_params)
-
     results = []
     if solution:
         for v_id in range(num_vehicles):
@@ -59,39 +55,49 @@ def solve_vrp(group_df, vehicle_capacity_kg=40, weight_per_order=1.5):
             while not routing.IsEnd(index):
                 node = manager.IndexToNode(index)
                 if node != 0:
-                    results.append({
-                        'Order_ID': order_ids[node],
-                        'CEE_ID': f"{group_df['sa_name'].iloc[0]}_CEE_{v_id+1}",
-                        'Sequence': seq
-                    })
+                    results.append({'Order_ID': order_ids[node], 'CEE_ID': f"CEE_{v_id+1}", 'Sequence': seq})
                     seq += 1
                 index = solution.Value(routing.NextVar(index))
     return pd.DataFrame(results)
 
-st.title("🚚 Last-Mile Route Generator")
-uploaded_file = st.file_uploader("Upload Order Report", type=["csv"])
+# --- UI LOGIC ---
+st.title("🏙️ City & Store Wise Delivery Optimizer")
+
+uploaded_file = st.file_uploader("Upload Delivery Report", type=["csv"])
 
 if uploaded_file:
     df = pd.read_csv(uploaded_file)
-    df = df[df['order_status'] != 'cancelled']
     
-    st.sidebar.header("Constraints")
-    cap = st.sidebar.number_input("Vehicle Capacity (kg)", value=40)
-    w_order = st.sidebar.number_input("Avg Order Weight (kg)", value=1.5)
+    # 1. Select City
+    cities = sorted(df['city'].unique())
+    selected_city = st.selectbox("Select City", cities)
     
-    if st.button("Generate Optimized Routes"):
-        all_routes = []
-        with st.spinner("Calculating routes per Service Area..."):
-            for sa, group in df.groupby('sa_name'):
-                sa_routes = solve_vrp(group, cap, w_order)
-                all_routes.append(sa_routes)
+    # 2. Select Store (dc_name)
+    city_df = df[df['city'] == selected_city]
+    stores = sorted(city_df['dc_name'].unique())
+    selected_store = st.selectbox("Select Store (DC Name)", stores)
+    
+    if st.button("Generate Routing Plan"):
+        store_data = city_df[city_df['dc_name'] == selected_store]
         
-        final_routes = pd.concat(all_routes)
-        output = pd.merge(final_routes, df[['order_id', 'fullName', 'address', 'sa_name']], 
-                          left_on='Order_ID', right_on='order_id').drop('order_id', axis=1)
+        # Solving per Service Area inside the store for better local density
+        all_store_routes = []
+        for sa, sa_group in store_data.groupby('sa_name'):
+            sa_plan = solve_vrp(sa_group)
+            if not sa_plan.empty:
+                sa_plan['sa_name'] = sa
+                all_store_routes.append(sa_plan)
         
-        st.success(f"Optimized {len(output)} orders across {output['CEE_ID'].nunique()} CEEs.")
-        st.dataframe(output)
-        
-        csv = output.to_csv(index=False).encode('utf-8')
-        st.download_button("Download Route Plan", csv, "optimized_routes.csv", "text/csv")
+        if all_store_routes:
+            final_plan = pd.concat(all_store_routes)
+            # Add customer info back
+            final_plan = pd.merge(final_plan, df[['order_id', 'fullName', 'address']], 
+                                 left_on='Order_ID', right_on='order_id').drop('order_id', axis=1)
+            
+            st.success(f"Generated routes for {selected_store} in {selected_city}")
+            st.dataframe(final_plan)
+            
+            csv = final_plan.to_csv(index=False).encode('utf-8')
+            st.download_button(f"Download {selected_store} Route CSV", csv, f"{selected_store}_routes.csv", "text/csv")
+        else:
+            st.warning("No valid orders found for this store.")
