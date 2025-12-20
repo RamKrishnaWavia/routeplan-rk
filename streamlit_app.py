@@ -4,15 +4,12 @@ import numpy as np
 from ortools.constraint_solver import routing_enums_pb2
 from ortools.constraint_solver import pywrapcp
 
-# --- APP CONFIG ---
-st.set_page_config(page_title="City & Store Delivery Router", layout="wide")
-
+# --- ROUTING ENGINE ---
 def solve_vrp(group_df, capacity_kg=40, weight_per_order=1.5):
-    """Routing Engine: Groups by SA within the selected Store."""
-    group_df = group_df[group_df['order_status'] != 'cancelled'].copy()
+    """Core logic to solve routing for a specific cluster."""
     if len(group_df) == 0: return pd.DataFrame()
 
-    # Simulation coordinates for clustering (replace with real geocoding in prod)
+    # Lat/Lon Simulation based on Pincode and Order ID for spatial grouping
     group_df['lat'] = 12.97 + (group_df['Pincode'] % 100) * 0.01 + (group_df['order_id'] % 100) * 0.0001
     group_df['lon'] = 77.59 + (group_df['Pincode'] % 100) * 0.01 + (group_df['order_id'] % 77) * 0.0001
 
@@ -23,7 +20,6 @@ def solve_vrp(group_df, capacity_kg=40, weight_per_order=1.5):
     weights = [0] + [int(weight_per_order * 10)] * (len(locations) - 1)
     max_cap_units = int(capacity_kg * 10)
     
-    # Estimate vehicles
     num_vehicles = int(np.ceil((len(group_df) * weight_per_order) / capacity_kg)) + 2
     dist_matrix = [[int(np.hypot(l1[0]-l2[0], l1[1]-l2[1]) * 100000) for l2 in locations] for l1 in locations]
 
@@ -60,44 +56,61 @@ def solve_vrp(group_df, capacity_kg=40, weight_per_order=1.5):
                 index = solution.Value(routing.NextVar(index))
     return pd.DataFrame(results)
 
-# --- UI LOGIC ---
-st.title("🏙️ City & Store Wise Delivery Optimizer")
+# --- STREAMLIT UI ---
+st.set_page_config(page_title="Master Delivery Router", layout="wide")
+st.title("🚛 Automated Master Delivery Router")
+st.markdown("This tool generates optimized routes for all Cities and Stores automatically.")
 
-uploaded_file = st.file_uploader("Upload Delivery Report", type=["csv"])
+uploaded_file = st.file_uploader("Upload Order Report (CSV)", type=["csv"])
 
 if uploaded_file:
     df = pd.read_csv(uploaded_file)
+    df = df[df['order_status'] != 'cancelled'] # Exclude cancelled orders
     
-    # 1. Select City
-    cities = sorted(df['city'].unique())
-    selected_city = st.selectbox("Select City", cities)
-    
-    # 2. Select Store (dc_name)
-    city_df = df[df['city'] == selected_city]
-    stores = sorted(city_df['dc_name'].unique())
-    selected_store = st.selectbox("Select Store (DC Name)", stores)
-    
-    if st.button("Generate Routing Plan"):
-        store_data = city_df[city_df['dc_name'] == selected_store]
+    if st.button("Generate Master Route Plan"):
+        master_results = []
+        progress_bar = st.progress(0)
         
-        # Solving per Service Area inside the store for better local density
-        all_store_routes = []
-        for sa, sa_group in store_data.groupby('sa_name'):
-            sa_plan = solve_vrp(sa_group)
-            if not sa_plan.empty:
-                sa_plan['sa_name'] = sa
-                all_store_routes.append(sa_plan)
+        # Get unique combinations of City and Store
+        clusters = df.groupby(['city', 'dc_name'])
+        total_clusters = len(clusters)
         
-        if all_store_routes:
-            final_plan = pd.concat(all_store_routes)
-            # Add customer info back
-            final_plan = pd.merge(final_plan, df[['order_id', 'fullName', 'address']], 
-                                 left_on='Order_ID', right_on='order_id').drop('order_id', axis=1)
+        for i, ((city, store), cluster_df) in enumerate(clusters):
+            # Process each Service Area within the Store
+            for sa, sa_df in cluster_df.groupby('sa_name'):
+                sa_plan = solve_vrp(sa_df)
+                if not sa_plan.empty:
+                    sa_plan['city'] = city
+                    sa_plan['store_name'] = store
+                    sa_plan['sa_name'] = sa
+                    master_results.append(sa_plan)
             
-            st.success(f"Generated routes for {selected_store} in {selected_city}")
-            st.dataframe(final_plan)
+            progress_bar.progress((i + 1) / total_clusters)
+
+        if master_results:
+            master_df = pd.concat(master_results)
             
-            csv = final_plan.to_csv(index=False).encode('utf-8')
-            st.download_button(f"Download {selected_store} Route CSV", csv, f"{selected_store}_routes.csv", "text/csv")
-        else:
-            st.warning("No valid orders found for this store.")
+            # Map back customer information
+            final_output = pd.merge(
+                master_df, 
+                df[['order_id', 'fullName', 'address', 'Pincode']], 
+                left_on='Order_ID', right_on='order_id'
+            ).drop('order_id', axis=1)
+
+            # Reorder columns for clarity
+            cols = ['city', 'store_name', 'sa_name', 'CEE_ID', 'Sequence', 'Order_ID', 'fullName', 'address', 'Pincode']
+            final_output = final_output[cols]
+
+            st.success("Master Plan Generated Successfully!")
+            st.write(f"Total Routes: {final_output['CEE_ID'].count()} | Total CEEs Assigned: {len(final_output.groupby(['city', 'store_name', 'sa_name', 'CEE_ID']))}")
+            
+            st.dataframe(final_output)
+
+            # Download Option
+            csv = final_output.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="Download Master Delivery Plan (CSV)",
+                data=csv,
+                file_name="master_delivery_plan.csv",
+                mime="text/csv"
+            )
