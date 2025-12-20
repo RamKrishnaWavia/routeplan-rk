@@ -68,7 +68,7 @@ def solve_vrp(group_df, vehicle_capacity_kg=40, weight_per_order=1.5):
                 index = solution.Value(routing.NextVar(index))
     return pd.DataFrame(results)
 
-st.title("🚚 Last-Mile Delivery Optimizer")
+st.title("🚚 Last-Mile Route Generator")
 uploaded_file = st.file_uploader("Upload Order Report", type=["csv"])
 
 if uploaded_file:
