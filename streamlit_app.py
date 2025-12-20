@@ -52,7 +52,7 @@ def solve_vrp(group_df, capacity_kg=40, weight_per_order=1.5):
 
 # --- APP UI ---
 st.set_page_config(page_title="Master Dispatch Router", layout="wide")
-st.title("📦 Master Store-Wise Dispatch Router")
+st.title("📦 Manual Route Generation Tool - RK Dec 2025")
 
 uploaded_file = st.file_uploader("Upload Order CSV", type=["csv"])
 
