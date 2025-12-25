@@ -32,7 +32,8 @@ with st.sidebar:
     show_charts = st.checkbox("Show Performance Charts", value=True)
     process_btn = st.button("🚀 Generate Dashboard")
 
-# --- DICTIONARY FOR MAPPING ---
+# --- COLUMN MAPPING DICTIONARY ---
+# This serves as our 'Master List'
 target_cols = {
     'delivery_date': 'Date' if lang == "English" else 'தேதி',
     'sa_name': 'Store Name' if lang == "English" else 'கிளை பெயர்',
@@ -47,30 +48,35 @@ target_cols = {
     'total_sales': 'Sale(₹)' if lang == "English" else 'விற்பனை(₹)',
     'overall_fr': 'Overall Fill Rate' if lang == "English" else 'நிறைவேற்றப்பட்ட விகிதம்',
     'otd_700': 'OTD 7:00 AM' if lang == "English" else 'நேரம் 7:00 AM',
-    'total_routes': 'Total Routes' if lang == "English" else 'மொத்த வழித்தடங்கள்'
+    'otd_730': 'OTD 7:30 AM' if lang == "English" else 'நேரம் 7:30 AM',
+    'otd_800': 'OTD 8:00 AM' if lang == "English" else 'நேரம் 8:00 AM',
+    'total_routes': 'Total Routes' if lang == "English" else 'மொத்த வழித்தடங்கள்',
+    'weight_per_route': 'Weight/Route' if lang == "English" else 'எடை/வழித்தடம்'
 }
 
 # --- MAIN PROCESSING ---
 if process_btn:
     with st.spinner("Processing Data..."):
+        # 1. Load Files
         df_ord = load_file("order_Report_SA_ID")
         df_sku = load_file("order_sku_sales_bb2")
         df_lmd = load_file("iot-rate-card-iot_orderwise")
 
         if df_ord is None:
-            st.error("❌ 'Order Report' not found.")
+            st.error("❌ 'Order Report' not found. Please upload the file to GitHub.")
         else:
-            # 2. Data Preparation
+            # 2. Data Preparation & Normalization
             df_ord['sa_name'] = df_ord['sa_name'].fillna('Unknown').astype(str).str.strip().str.upper()
             df_ord['delivery_date'] = pd.to_datetime(df_ord['delivery_date'], errors='coerce').dt.date
             
+            # Create boolean flags
             df_ord['is_delivered'] = df_ord['order_status'].str.lower().isin(['complete', 'delivered'])
             df_ord['is_sub'] = df_ord['Type'].str.lower() == 'subscription'
             df_ord['is_topup'] = df_ord['Type'].str.lower() == 'topup'
             df_ord['is_oos'] = df_ord['cancellation_reason'].str.contains('OOS|stock', case=False, na=False)
             df_ord['is_cx_cancel'] = df_ord['cancellation_reason'].str.contains('customer', case=False, na=False)
 
-            # 3. Aggregation
+            # 3. Core Aggregation
             summary = df_ord.groupby(['delivery_date', 'sa_name']).agg(
                 total_customers=('member_id', 'nunique'),
                 total_orders=('order_id', 'nunique'),
@@ -83,12 +89,15 @@ if process_btn:
                 delivered_qty=('finalquantity', 'sum')
             ).reset_index()
 
-            # Merges (LMD & Sales)
+            # 4. Conditional Merges (Avoids Crashes if files are missing)
             if df_lmd is not None:
                 df_lmd['sa_name'] = df_lmd['sa_name'].fillna('Unknown').astype(str).str.strip().str.upper()
                 df_lmd['dt'] = pd.to_datetime(df_lmd['order_delivered_time'], errors='coerce').dt.date
+                
                 lmd_agg = df_lmd.groupby(['dt', 'sa_name']).agg(
                     otd_700=('order_delivered_time', lambda x: (pd.to_datetime(x).dt.time < datetime.strptime('07:00', '%H:%M').time()).mean()),
+                    otd_730=('order_delivered_time', lambda x: (pd.to_datetime(x).dt.time < datetime.strptime('07:30', '%H:%M').time()).mean()),
+                    otd_800=('order_delivered_time', lambda x: (pd.to_datetime(x).dt.time < datetime.strptime('08:00', '%H:%M').time()).mean()),
                     total_routes=('route_id', 'nunique')
                 ).reset_index()
                 summary = pd.merge(summary, lmd_agg, left_on=['delivery_date', 'sa_name'], right_on=['dt', 'sa_name'], how='left')
@@ -99,21 +108,26 @@ if process_btn:
                 sales_agg = df_sku.groupby(['delivery_date', 'sa_name'])['total_sales'].sum().reset_index()
                 summary = pd.merge(summary, sales_agg, on=['delivery_date', 'sa_name'], how='left')
 
+            # 5. Final Calculations
             summary['orders_undelivered'] = summary['total_orders'] - summary['orders_delivered']
             summary['overall_fr'] = (summary['delivered_qty'] / summary['ordered_qty']).fillna(0)
 
-            # --- CHARTS SECTION ---
-            if show_charts:
-                st.subheader("📈 Delivery Performance by Store")
-                chart_data = summary.set_index('sa_name')[['orders_delivered', 'orders_undelivered']]
-                st.bar_chart(chart_data, color=["#2ecc71", "#e74c3c"]) # Green for Delivered, Red for Undelivered
-
-            # --- DYNAMIC TABLE ---
+            # 6. DYNAMIC COLUMN SELECTION (THE FIX)
+            # This line looks at our Master List and only takes what actually exists in 'summary'
             available_cols = [col for col in target_cols.keys() if col in summary.columns]
             final_df = summary[available_cols].rename(columns=target_cols).fillna(0)
-            
+
+            # --- 7. VISUALS ---
+            if show_charts:
+                st.subheader("📈 Delivery Performance by Store")
+                # Prepare data for stacked chart
+                chart_pivot = summary.pivot(index='sa_name', columns=None, values=['orders_delivered', 'orders_undelivered'])
+                st.bar_chart(summary.set_index('sa_name')[['orders_delivered', 'orders_undelivered']], color=["#2ecc71", "#e74c3c"])
+
+            # --- 8. DISPLAY TABLE ---
             st.subheader("📑 Data Summary")
             st.dataframe(final_df, use_container_width=True)
 
+            # Download
             csv = final_df.to_csv(index=False).encode('utf-8')
-            st.download_button("📥 Download Report", data=csv, file_name="BBD_Performance.csv", mime='text/csv')
+            st.download_button("📥 Download Full Report", data=csv, file_name=f"BBD_Report_{datetime.now().date()}.csv", mime='text/csv')
