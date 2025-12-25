@@ -1,89 +1,139 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from ortools.constraint_solver import routing_enums_pb2
-from ortools.constraint_solver import pywrapcp
+import os
+from datetime import datetime
 
-# --- ROUTING ENGINE ---
-def solve_vrp(group_df, capacity_kg=40, weight_per_order=1.5):
-    if len(group_df) == 0: return pd.DataFrame()
+# --- PAGE SETUP ---
+st.set_page_config(page_title="BBD Daily Summary", layout="wide")
+st.title("🚀 BBD Daily Summary Dashboard")
 
-    # Lat/Lon Simulation based on Pincode
-    group_df['lat'] = 12.97 + (group_df['Pincode'] % 100) * 0.01 + (group_df['order_id'] % 100) * 0.0001
-    group_df['lon'] = 77.59 + (group_df['Pincode'] % 100) * 0.01 + (group_df['order_id'] % 77) * 0.0001
+def load_file(keyword):
+    """Search for files matching the keyword (case-insensitive)"""
+    all_files = os.listdir('.')
+    matches = [f for f in all_files if keyword.lower() in f.lower() and f.endswith(('.csv', '.xlsx'))]
+    if not matches:
+        return None
+    target = matches[0]
+    try:
+        if target.endswith('.csv'):
+            return pd.read_csv(target, low_memory=False)
+        else:
+            return pd.read_excel(target, engine='openpyxl')
+    except Exception as e:
+        st.error(f"Error loading {target}: {e}")
+        return None
 
-    depot_lat, depot_lon = group_df['lat'].mean(), group_df['lon'].mean()
-    locations = [[depot_lat, depot_lon]] + group_df[['lat', 'lon']].values.tolist()
-    order_ids = ["DEPOT"] + group_df['order_id'].tolist()
-    
-    weights = [0] + [int(weight_per_order * 10)] * (len(locations) - 1)
-    max_cap_units = int(capacity_kg * 10)
-    num_vehicles = int(np.ceil((len(group_df) * weight_per_order) / capacity_kg)) + 2
-    dist_matrix = [[int(np.hypot(l1[0]-l2[0], l1[1]-l2[1]) * 100000) for l2 in locations] for l1 in locations]
+# --- MAIN PROCESSING LOGIC ---
+if st.button("Generate Complete Dashboard"):
+    with st.spinner("Processing files and calculating metrics..."):
+        # 1. Load Datasets
+        df_ord = load_file("order_Report_SA_ID")
+        df_sku = load_file("order_sku_sales_bb2")
+        df_lmd = load_file("iot-rate-card-iot_orderwise")
 
-    manager = pywrapcp.RoutingIndexManager(len(locations), num_vehicles, 0)
-    routing = pywrapcp.RoutingModel(manager)
+        if df_ord is None:
+            st.error("❌ Critical Error: 'order_Report_SA_ID' file not found.")
+        else:
+            # --- DATA CLEANING ---
+            # Standardize Store Names and Dates to ensure merge works
+            df_ord['sa_name'] = df_ord['sa_name'].fillna('Unknown').astype(str).str.strip().str.upper()
+            df_ord['delivery_date'] = pd.to_datetime(df_ord['delivery_date'], errors='coerce').dt.normalize()
+            
+            # Convert numeric columns
+            num_cols = ['OriginalQty', 'finalquantity', 'OriginalOrderValue', 'FinalOrderValue']
+            for col in num_cols:
+                df_ord[col] = pd.to_numeric(df_ord[col], errors='coerce').fillna(0)
 
-    def dist_cb(from_idx, to_idx): return dist_matrix[manager.IndexToNode(from_idx)][manager.IndexToNode(to_idx)]
-    transit_idx = routing.RegisterTransitCallback(dist_cb)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit_idx)
+            # Pre-calculate flags (Avoids broadcasting errors in groupby)
+            df_ord['is_delivered'] = df_ord['order_status'].str.lower().isin(['complete', 'delivered'])
+            df_ord['is_sub'] = df_ord['Type'].str.lower() == 'subscription'
+            df_ord['is_topup'] = df_ord['Type'].str.lower() == 'topup'
+            df_ord['is_milk'] = df_ord['Milk / NM'].str.lower() == 'milk'
+            df_ord['is_non_milk'] = df_ord['Milk / NM'].str.lower() == 'non-milk'
+            df_ord['is_oos'] = df_ord['cancellation_reason'].str.contains('OOS|stock', case=False, na=False)
+            df_ord['is_cx_cancel'] = df_ord['cancellation_reason'].str.contains('customer', case=False, na=False)
 
-    def demand_cb(from_idx): return weights[manager.IndexToNode(from_idx)]
-    demand_idx = routing.RegisterUnaryTransitCallback(demand_cb)
-    routing.AddDimensionWithVehicleCapacity(demand_idx, 0, [max_cap_units]*num_vehicles, True, 'Capacity')
+            # --- 1. CORE AGGREGATION ---
+            summary = df_ord.groupby(['delivery_date', 'sa_name']).agg(
+                total_customers=('member_id', 'nunique'),
+                total_orders=('order_id', 'nunique'),
+                orders_delivered=('is_delivered', 'sum'), # Boolean sum
+                sub_orders=('is_sub', 'sum'),
+                topup_orders=('is_topup', 'sum'),
+                oos_cancellations=('is_oos', 'sum'),
+                cx_cancellations=('is_cx_cancel', 'sum'),
+                ordered_qty=('OriginalQty', 'sum'),
+                delivered_qty=('finalquantity', 'sum'),
+                # Weighted Qty calculations using masking
+                milk_qty_ordered=('OriginalQty', lambda x: df_ord.loc[x.index, 'is_milk'].multiply(df_ord.loc[x.index, 'OriginalQty']).sum()),
+                milk_qty_delivered=('finalquantity', lambda x: df_ord.loc[x.index, 'is_milk'].multiply(df_ord.loc[x.index, 'finalquantity']).sum()),
+                nmilk_qty_ordered=('OriginalQty', lambda x: df_ord.loc[x.index, 'is_non_milk'].multiply(df_ord.loc[x.index, 'OriginalQty']).sum()),
+                nmilk_qty_delivered=('finalquantity', lambda x: df_ord.loc[x.index, 'is_non_milk'].multiply(df_ord.loc[x.index, 'finalquantity']).sum()),
+                sub_qty=('OriginalQty', lambda x: df_ord.loc[x.index, 'is_sub'].multiply(df_ord.loc[x.index, 'OriginalQty']).sum())
+            ).reset_index()
 
-    search_params = pywrapcp.DefaultRoutingSearchParameters()
-    search_params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    search_params.time_limit.seconds = 1
+            # --- 2. LOGISTICS & OTD (From LMD Report) ---
+            if df_lmd is not None:
+                df_lmd['sa_name'] = df_lmd['sa_name'].fillna('Unknown').astype(str).str.strip().str.upper()
+                df_lmd['dt'] = pd.to_datetime(df_lmd['order_delivered_time'], errors='coerce').dt.normalize()
+                
+                # Convert time for OTD
+                def check_otd(series, time_str):
+                    limit = datetime.strptime(time_str, '%H:%M').time()
+                    times = pd.to_datetime(series, errors='coerce').dt.time
+                    return (times < limit).mean()
 
-    solution = routing.SolveWithParameters(search_params)
-    results = []
-    if solution:
-        for v_id in range(num_vehicles):
-            idx = routing.Start(v_id)
-            seq = 1
-            while not routing.IsEnd(idx):
-                node = manager.IndexToNode(idx)
-                if node != 0:
-                    results.append({'Order_ID': order_ids[node], 'Temp_Route': v_id + 1, 'Sequence': seq})
-                    seq += 1
-                idx = solution.Value(routing.NextVar(idx))
-    return pd.DataFrame(results)
+                lmd_agg = df_lmd.groupby(['dt', 'sa_name']).agg(
+                    otd_700=('order_delivered_time', lambda x: check_otd(x, '07:00')),
+                    otd_730=('order_delivered_time', lambda x: check_otd(x, '07:30')),
+                    otd_800=('order_delivered_time', lambda x: check_otd(x, '08:00')),
+                    total_routes=('route_id', 'nunique'),
+                    total_weight=('weight', 'sum')
+                ).reset_index()
+                summary = pd.merge(summary, lmd_agg, left_on=['delivery_date', 'sa_name'], right_on=['dt', 'sa_name'], how='left')
 
-# --- APP UI ---
-st.set_page_config(page_title="Master Dispatch Router", layout="wide")
-st.title("📦 Manual Route Generation Tool - RK Dec 2025 - inpout file - order_report_sa_id_bb2.0")
+            # --- 3. SALES (From SKU Report) ---
+            if df_sku is not None:
+                df_sku['sa_name'] = df_sku['sa_name'].fillna('Unknown').astype(str).str.strip().str.upper()
+                df_sku['delivery_date'] = pd.to_datetime(df_sku['delivery_date'], errors='coerce').dt.normalize()
+                sales_agg = df_sku.groupby(['delivery_date', 'sa_name'])['total_sales'].sum().reset_index()
+                summary = pd.merge(summary, sales_agg, on=['delivery_date', 'sa_name'], how='left')
 
-uploaded_file = st.file_uploader("Upload Order CSV", type=["csv"])
+            # --- 4. CALCULATED RATIOS ---
+            summary['orders_undelivered'] = summary['total_orders'] - summary['orders_delivered']
+            summary['abv'] = (summary['total_sales'] / summary['orders_delivered']).replace([np.inf, -np.inf], 0).fillna(0)
+            summary['abq'] = (summary['delivered_qty'] / summary['orders_delivered']).replace([np.inf, -np.inf], 0).fillna(0)
+            summary['fr_milk'] = (summary['milk_qty_delivered'] / summary['milk_qty_ordered']).fillna(0)
+            summary['fr_non_milk'] = (summary['nmilk_qty_delivered'] / summary['nmilk_qty_ordered']).fillna(0)
+            summary['overall_fr'] = (summary['delivered_qty'] / summary['ordered_qty']).fillna(0)
+            
+            if 'total_weight' in summary.columns:
+                summary['weight_per_route'] = summary['total_weight'] / summary['total_routes']
+                summary['weight_per_order'] = summary['total_weight'] / summary['orders_delivered']
 
-if uploaded_file:
-    df = pd.read_csv(uploaded_file)
-    df = df[df['order_status'] != 'cancelled']
-    
-    if st.button("Generate Master Plan"):
-        master_list = []
-        # Group by City and Store
-        for (city, store), store_df in df.groupby(['city', 'dc_name']):
-            store_route_idx = 0
-            # Group by SA within Store
-            for sa, sa_df in store_df.groupby('sa_name'):
-                sa_plan = solve_vrp(sa_df)
-                if not sa_plan.empty:
-                    # Create continuous route numbers per store
-                    r_map = {old: (store_route_idx + i + 1) for i, old in enumerate(sa_plan['Temp_Route'].unique())}
-                    sa_plan['Route_Number'] = sa_plan['Temp_Route'].map(r_map)
-                    sa_plan['CEE_ID'] = sa_plan['Route_Number'].apply(lambda x: f"{store}_CEE_{x}")
-                    
-                    sa_plan['city'], sa_plan['store_name'], sa_plan['sa_name'] = city, store, sa
-                    master_list.append(sa_plan)
-                    store_route_idx += len(r_map)
+            # --- FINAL FORMATTING (KeyError Prevention) ---
+            target_cols = {
+                'delivery_date': 'Date', 'sa_name': 'Store Name',
+                'total_customers': 'Total Ordered Customers (Unique)', 'total_orders': 'Total Orders',
+                'orders_delivered': 'Orders Delivered', 'sub_orders': 'Subscription Orders',
+                'topup_orders': 'Top-up Orders', 'orders_undelivered': 'Orders Undelivered',
+                'cx_cancellations': 'Cancelled Orders by Customer', 'oos_cancellations': 'Undelivered Orders Due to OOS',
+                'ordered_qty': 'Total Ordered Quantity', 'sub_qty': 'Subscription Quantity',
+                'milk_qty_ordered': 'Milk Qty (Ord)', 'milk_qty_delivered': 'Milk Qty (Del)',
+                'nmilk_qty_ordered': 'NM Qty (Ord)', 'nmilk_qty_delivered': 'NM Qty (Del)',
+                'otd_700': 'OTD 7:00 AM', 'otd_730': 'OTD 7:30 AM', 'otd_800': 'OTD 8:00 AM',
+                'abv': 'ABV', 'abq': 'ABQ', 'overall_fr': 'Overall Fill Rate', 'total_sales': 'Sale(₹)',
+                'total_routes': 'Routes', 'weight_per_route': 'Wt/Route'
+            }
 
-        final_df = pd.concat(master_list)
-        final_df = pd.merge(final_df, df[['order_id', 'fullName', 'address']], left_on='Order_ID', right_on='order_id').drop('order_id', axis=1)
-        
-        # UI Display
-        st.success("Plan Created: Use 'Route_Number' to group trucks per store.")
-        st.dataframe(final_df[['city', 'store_name', 'Route_Number', 'CEE_ID', 'sa_name', 'Sequence', 'fullName', 'address']])
-        
-        csv = final_df.to_csv(index=False).encode('utf-8')
-        st.download_button("Download Master Plan", csv, "master_delivery_plan.csv", "text/csv")
+            # Only select columns that actually ended up in the dataframe
+            final_selection = [col for col in target_cols.keys() if col in summary.columns]
+            final_df = summary[final_selection].rename(columns=target_cols).fillna(0)
+
+            # Display
+            st.success("✅ Dashboard Generated")
+            st.dataframe(final_df, use_container_width=True)
+            
+            csv = final_df.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download CSV", data=csv, file_name="BBD_Summary.csv", mime="text/csv")
